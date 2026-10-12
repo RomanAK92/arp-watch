@@ -1,5 +1,5 @@
 """ARP Watch: bounded active probes, durable incidents, read-only MAC tracing."""
-import base64,hashlib,hmac,http.server,ipaddress,json,os,pathlib,queue,re,secrets,socket,sqlite3,struct,threading,time
+import copy,base64,hashlib,hmac,http.server,ipaddress,json,os,pathlib,queue,re,secrets,socket,sqlite3,struct,threading,time
 from http.cookies import SimpleCookie
 from urllib.parse import urlsplit,urlencode
 from urllib.request import build_opener,ProxyHandler
@@ -7,6 +7,7 @@ from datetime import datetime,timezone,timedelta
 CONFIG=os.environ.get('ARP_CONFIG','/config/config.json')
 DATA=pathlib.Path(os.environ.get('ARP_DATA','/data'))
 UI_DIR=pathlib.Path(__file__).resolve().parent
+from setup_config import KEYS as SETUP_KEYS,public_setup,validate as validate_setup,interfaces,discovery_hosts
 def now():return datetime.now(timezone.utc).isoformat()
 
 def password_hash(password):
@@ -24,12 +25,12 @@ def load_settings(cfg):
  path=pathlib.Path(cfg.get('_settings_path',DATA/'settings.json'))
  if path.exists():
   saved=json.loads(path.read_text())
-  for key in ['dashboard_user','account_password_hash','resolved_retention_days']:
+  for key in ['dashboard_user','account_password_hash','resolved_retention_days']+SETUP_KEYS:
    if key in saved:cfg[key]=saved[key]
  cfg.setdefault('resolved_retention_days',30)
 
 def save_settings(cfg,changes):
- path=pathlib.Path(cfg.get('_settings_path',DATA/'settings.json'));saved={k:cfg[k] for k in ['dashboard_user','account_password_hash','resolved_retention_days'] if k in cfg};saved.update(changes)
+ path=pathlib.Path(cfg.get('_settings_path',DATA/'settings.json'));saved={k:cfg[k] for k in ['dashboard_user','account_password_hash','resolved_retention_days']+SETUP_KEYS if k in cfg};saved.update(changes)
  # Separate writable settings retain the read-only switch/notification config.
  tmp=path.with_suffix('.tmp');fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
  try:
@@ -81,6 +82,7 @@ def kuma_report(cfg,store,sensor):
    # running. Detection alerts are delayed by at most ten seconds, never hidden.
    deadline=time.monotonic()+10
    while sensor.traces_pending() and time.monotonic()<deadline:time.sleep(.25)
+   if not cfg.get('kuma_push_url'):time.sleep(5);continue
    st=sensor.snapshot();message=kuma_message(cfg,st,store.rows())
    url=cfg['kuma_push_url']+'?'+urlencode({'status':'up' if st['state']=='clear' else 'down','msg':message})
    with opener.open(url,timeout=8) as response:
@@ -189,27 +191,48 @@ class Sensor:
  def traces_pending(self):
   with self.lock:return bool(self.pending)
  def cycle(self):
-  targets={}
-  for target in self.cfg['targets']:
+  with self.lock:cfg=copy.deepcopy(self.cfg);revision=cfg.get('_revision',0);targets={ip:t for ip,t in self.status['targets'].items() if t.get('discovery')}
+  trusted={t['ip'] for t in cfg['targets']};network=cfg.get('discovery_network','')
+  all_candidates=discovery_hosts(network,trusted|{getattr(self,'local_ip','')})
+  followups=list(dict.fromkeys(r['ip'] for r in self.store.rows() if not r['resolved_at'] and r['ip'] in all_candidates))[:64]
+  candidates=all_candidates
+  if getattr(self,'scan_network',None)!=network:self.scan_network=network;self.scan_index=0;self.discovery_seen=set()
+  if candidates:
+   count=min(2,max(1,int(cfg.get('discovery_batch',2))),len(candidates));batch=[]
+   for _ in range(len(candidates)):
+    ip=candidates[self.scan_index%len(candidates)];self.scan_index=(self.scan_index+1)%len(candidates)
+    if ip not in followups:batch.append(ip)
+    if len(batch)>=count:break
+   self.discovery_seen.update(batch)
+  else:batch=[]
+  self.discovery_seen.update(followups)
+  selections=cfg['targets']+[{'ip':ip,'name':'Subnet discovery','approved_macs':[],'vlan':1,'discovery':True} for ip in followups+batch]
+  for target in selections:
    ip=target['ip'];replies=self.probe(ip);approved=target['approved_macs'];macs=sorted(replies)
-   i,new=self.store.detect(ip,macs,approved,{'source':'ARP probe','interface':self.cfg['interface'],'sender_ip':'0.0.0.0','replies':list(replies.values())})
-   targets[ip]={'name':target['name'],'vlan':target.get('vlan',1),'approved_macs':approved,'observed_macs':macs,'checked_at':now(),'conflict_present':bool(set(macs)-set(approved)) if approved else len(macs)>1,'responded':bool(macs)}
+   i,new=self.store.detect(ip,macs,approved,{'source':'ARP probe','interface':cfg['interface'],'sender_ip':'0.0.0.0','replies':list(replies.values())})
+   targets[ip]={'name':target['name'],'vlan':target.get('vlan',1),'approved_macs':approved,'observed_macs':macs,'checked_at':now(),'conflict_present':bool(set(macs)-set(approved)) if approved else len(macs)>1,'responded':bool(macs),'discovery':target.get('discovery',False)}
    # Publish this observation immediately so a simultaneous notification does
    # not describe the preceding clean cycle after detecting a new conflict.
-   with self.lock:self.status['targets'][ip]=targets[ip]
-   if i:
+   with self.lock:
+    if self.cfg.get('_revision',0)==revision:self.status['targets'][ip]=targets[ip]
+   if i and cfg.get('core') and cfg.get('switches'):
     # Unexpected MACs first, then approved peers. Retry unresolved traces every five minutes.
     row=next(r for r in self.store.rows() if r['id']==i)
     for mac in sorted(macs,key=lambda m:m in approved):
      old=row['trace'].get(mac,{})
      retry_seconds=30 if any(e.startswith('MAC absent or ambiguous') for e in old.get('errors',[])) else 300
      if new or not old or (old.get('status')!='access_port' and time.time()-old.get('epoch',0)>retry_seconds):self.queue_trace(i,mac)
-  with self.lock:self.status.update(last_cycle=time.time(),error=None,targets=targets)
+  with self.lock:
+   if self.cfg.get('_revision',0)==revision:self.status.update(last_cycle=time.time(),error=None,targets=targets,discovery_checked=len(self.discovery_seen),discovery_total=len(all_candidates),discovery_cursor=getattr(self,'scan_index',0),cycle_seconds=len(selections)*1.2)
+
  def run(self):
   while True:
    started=time.monotonic()
    try:
-    iface=self.cfg['interface'];self.mac=bytes.fromhex(pathlib.Path('/sys/class/net/'+iface+'/address').read_text().strip().replace(':',''))
+    iface=self.cfg['interface']
+    if not iface or (not self.cfg.get('targets') and not self.cfg.get('discovery_network')):raise ValueError('Complete the setup wizard before monitoring')
+    self.local_ip=next((i['ip'] for i in interfaces() if i['name']==iface),'')
+    self.mac=bytes.fromhex(pathlib.Path('/sys/class/net/'+iface+'/address').read_text().strip().replace(':',''))
     self.sock=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0806));self.sock.bind((iface,0));self.sock.settimeout(.1)
     self.cycle()
    except Exception as e:
@@ -219,13 +242,14 @@ class Sensor:
    time.sleep(max(1,self.cfg['interval']-(time.monotonic()-started)))
  def snapshot(self):
   with self.lock:st=json.loads(json.dumps(self.status))
-  healthy=not st['error'] and time.time()-st['last_cycle']<self.cfg['interval']*3 and all(t['responded'] for t in st['targets'].values()) and len(st['targets'])==len(self.cfg['targets'])
+  expected=[t['ip'] for t in self.cfg['targets']];freshness=max(self.cfg['interval']*3,st.get('cycle_seconds',0)+self.cfg['interval']+15)
+  healthy=not st['error'] and time.time()-st['last_cycle']<freshness and all(st['targets'].get(ip,{}).get('responded') for ip in expected) and bool(expected or self.cfg.get('discovery_network'))
   n=self.store.open_count();st.update(healthy=healthy,open_count=n,state='unavailable' if not healthy else 'incident' if n else 'clear',message='Monitoring unavailable' if not healthy else str(n)+' unresolved incident(s)' if n else 'No unresolved conflicts detected',checked_scope=self.cfg.get('scope_label','Configured addresses / VLAN 1'),trace_jobs=self.jobs.qsize(),probe_interval=self.cfg['interval'],interface=self.cfg.get('interface',''),segments=self.cfg.get('segments',[{'id':1,'name':'Main LAN','network':self.cfg.get('network','Configured LAN'),'status':'active','note':'Selected addresses only.'}]))
   return st
  def tracer(self):
   from cli_runtime import CLI
   while True:
-   i,mac=self.jobs.get();path=[];result={'epoch':time.time(),'observed_at':now(),'status':'unresolved','path':path,'topology_source':'Audited LLDP mapping; each MAC location queried live','errors':[]};visited=set();host=self.cfg['core'];uplink=None
+   i,mac=self.jobs.get();path=[];result={'epoch':time.time(),'observed_at':now(),'status':'unresolved','path':path,'topology_source':'Audited LLDP mapping; each MAC location queried live','errors':[]};visited=set();host=self.cfg.get('core','');uplink=None
    try:
     for hop in range(12):
      if host in visited:result['errors'].append('Cycle in path; stopped');break
@@ -267,7 +291,8 @@ class Sensor:
     self.jobs.task_done()
  def can_resolve(self,row):
   st=self.snapshot();target=st['targets'].get(row['ip'])
-  return st['healthy'] and target and not target['conflict_present']
+  recent=not target or not target.get('discovery') or time.time()-datetime.fromisoformat(target['checked_at']).timestamp()<max(90,st.get('cycle_seconds',0)+self.cfg['interval']+15)
+  return st['healthy'] and target and recent and not target['conflict_present']
 def serve(cfg,store,sensor):
  sessions={};session_lock=threading.RLock();attempts={}
  def credentials_match(username,password):
@@ -305,9 +330,13 @@ def serve(cfg,store,sensor):
     if self.authenticated():self.redirect('/')
     else:self.respond(200,(UI_DIR/'login.html').read_bytes(),'text/html; charset=utf-8')
     return
-   if self.path in ['/','/settings'] and not self.authenticated():self.redirect('/login');return
+   if self.path in ['/','/settings','/setup'] and not self.authenticated():self.redirect('/login');return
    if not self.authorized():return
+   if self.path=='/' and not cfg.get('targets') and not cfg.get('discovery_network'):self.redirect('/setup');return
    if self.path=='/':self.respond(200,(UI_DIR/'dashboard.html').read_bytes(),'text/html; charset=utf-8')
+   elif self.path=='/setup':self.respond(200,(UI_DIR/'wizard.html').read_bytes(),'text/html; charset=utf-8')
+   elif self.path=='/api/setup':
+    value=public_setup(cfg);value['csrf']=cfg['csrf'];self.respond(200,value)
    elif self.path=='/settings':self.respond(200,(UI_DIR/'settings.html').read_bytes(),'text/html; charset=utf-8')
    elif self.path=='/api/settings':self.respond(200,{'username':cfg['dashboard_user'],'resolved_retention_days':cfg.get('resolved_retention_days',30),'csrf':cfg['csrf']})
    elif self.path=='/api/state':
@@ -339,6 +368,26 @@ def serve(cfg,store,sensor):
     self.respond(200,{'signed_in':True},headers={'Set-Cookie':cookie});return
    if not self.authorized():return
    if self.headers.get('X-CSRF-Token')!=cfg['csrf']:self.respond(403,{'error':'CSRF check failed'});return
+   if self.path=='/api/setup':
+    try:
+     size=int(self.headers.get('Content-Length',0))
+     if size<1 or size>65536:raise ValueError('Invalid setup request size')
+     body=json.loads(self.rfile.read(size))
+     if not body.get('review_confirmed'):raise ValueError('Review and confirm the monitoring scope before saving')
+     with session_lock:
+      recent=[t for t in attempts.get(self.client_address[0],[]) if t>time.time()-60]
+      if len(recent)>=10:self.respond(429,{'error':'Too many attempts. Try again in one minute.'});return
+      if not password_matches(cfg,str(body.get('current_password',''))):attempts[self.client_address[0]]=recent+[time.time()];self.respond(401,{'error':'Current password is incorrect'});return
+      attempts.pop(self.client_address[0],None)
+      changes=validate_setup(body,cfg,interfaces());trusted={t['ip'] for t in changes['targets']};network=ipaddress.ip_network(changes['discovery_network']) if changes['discovery_network'] else None
+      for row in store.rows():
+       if not row['resolved_at'] and row['ip'] not in trusted and (not network or ipaddress.ip_address(row['ip']) not in network):raise ValueError('Resolve existing incidents before removing their IP from monitoring')
+      with sensor.lock:
+       save_settings(cfg,changes);cfg['_revision']=cfg.get('_revision',0)+1;sensor.status.update(last_cycle=0,error='Configuration saved; waiting for first check',targets={});sensor.scan_network=None
+     self.respond(200,{'saved':True,'message':'Monitoring will apply the saved setup on the next cycle. Existing incident evidence is retained.'})
+    except (ValueError,KeyError,TypeError) as e:self.respond(400,{'error':str(e)})
+    except Exception:self.respond(500,{'error':'Setup could not be saved'})
+    return
    if self.path=='/api/settings':
     try:
      size=int(self.headers.get('Content-Length',0))
@@ -389,7 +438,7 @@ if __name__=='__main__':
  cfg=json.loads(pathlib.Path(CONFIG).read_text());DATA.mkdir(exist_ok=True);load_settings(cfg);store=Store(DATA/'incidents.sqlite3');sensor=Sensor(cfg,store)
  threading.Thread(target=retention_worker,args=(cfg,store,sensor),daemon=True).start()
  threading.Thread(target=sensor.run,daemon=True).start();threading.Thread(target=sensor.tracer,daemon=True).start()
- if cfg.get('kuma_push_url'):
+ if True:
   # Allow the first probe cycle to finish before sending the startup heartbeat.
   def start_report():time.sleep(18);kuma_report(cfg,store,sensor)
   threading.Thread(target=start_report,daemon=True).start()
