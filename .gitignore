@@ -1,0 +1,9 @@
+config.json
+data/
+*.sqlite*
+__pycache__/
+*.pyc
+.env
+.venv/
+backups/
+*.log
