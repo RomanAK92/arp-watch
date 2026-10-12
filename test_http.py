@@ -1,6 +1,9 @@
 """Isolated HTTP lifecycle test. No ARP packets, switch logins, or notifications."""
 import base64,json,pathlib,secrets,tempfile,threading,time,urllib.request,urllib.error
 from app import Store,Sensor,serve
+import app,setup_config
+fixture_interfaces=lambda:[{"name":"test0","ip":"192.0.2.147","network":"192.0.2.0/24"}]
+app.interfaces=fixture_interfaces;setup_config.interfaces=fixture_interfaces
 temp=tempfile.TemporaryDirectory();store=Store(pathlib.Path(temp.name)/'test.sqlite3');password=secrets.token_urlsafe(12)
 cfg={'targets':[{'ip':'192.0.2.1'}],'interval':15,'bind':'127.0.0.1','port':8097,'dashboard_user':'test','dashboard_password':password,'csrf':secrets.token_urlsafe(20),'_settings_path':str(pathlib.Path(temp.name)/'settings.json')}
 sensor=Sensor(cfg,store);good='aa:bb:cc:dd:ee:01';bad='aa:bb:cc:dd:ee:02'
@@ -32,6 +35,15 @@ except urllib.error.HTTPError as error:assert error.code==401
 i,_=store.detect('192.0.2.1',[good,bad],[good],{'source':'isolated test; no network packets'})
 sensor.status['targets']['192.0.2.1']['conflict_present']=True
 assert req('/health')[0]==503
+assert req('/api/setup',authorized=False)[0]==401
+safe=json.loads(req('/api/setup')[1]);assert 'kuma_push_url' not in safe
+setup_body={'interface':'test0','network':'192.0.2.0/24','dashboard_url':'http://192.0.2.147:8096/','targets':[{'ip':'192.0.2.1','name':'Router','approved_macs':[good]}],'discovery_enabled':False,'tracing_enabled':False,'kuma_enabled':False,'review_confirmed':True,'current_password':password}
+assert req('/api/setup',setup_body,csrf=False)[0]==403
+assert req('/api/setup',{**setup_body,'review_confirmed':False})[0]==400
+assert req('/api/setup',{**setup_body,'targets':[{'ip':'192.0.2.2','approved_macs':[good]}]})[0]==400 # Open incident cannot be orphaned.
+assert req('/api/setup',setup_body)[0]==200
+sensor.status.update(last_cycle=time.time(),error=None,targets={'192.0.2.1':{'responded':True,'conflict_present':True}})
+assert store.open_count()==1
 assert req('/api/settings',authorized=False)[0]==401
 assert req('/api/settings',{'current_password':password,'resolved_retention_days':30},csrf=False)[0]==403
 assert req('/api/settings',{'current_password':'wrong','resolved_retention_days':30})[0]==401
