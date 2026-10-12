@@ -249,7 +249,7 @@ class Sensor:
  def tracer(self):
   from cli_runtime import CLI
   while True:
-   i,mac=self.jobs.get();path=[];result={'epoch':time.time(),'observed_at':now(),'status':'unresolved','path':path,'topology_source':'Audited LLDP mapping; each MAC location queried live','errors':[]};visited=set();host=self.cfg.get('core','');uplink=None
+   i,mac=self.jobs.get();path=[];result={'epoch':time.time(),'observed_at':now(),'status':'unresolved','path':path,'topology_source':'Configured switch-link mapping; each MAC location queried live','errors':[]};visited=set();host=self.cfg.get('core','');uplink=None
    try:
     for hop in range(12):
      if host in visited:result['errors'].append('Cycle in path; stopped');break
