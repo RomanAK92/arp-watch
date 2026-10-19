@@ -8,6 +8,7 @@ CONFIG=os.environ.get('ARP_CONFIG','/config/config.json')
 DATA=pathlib.Path(os.environ.get('ARP_DATA','/data'))
 UI_DIR=pathlib.Path(__file__).resolve().parent
 from setup_config import KEYS as SETUP_KEYS,public_setup,validate as validate_setup,interfaces,discovery_hosts
+from availability import Availability,details as availability_details,summary_lines as availability_lines,safe_error
 def now():return datetime.now(timezone.utc).isoformat()
 
 def password_hash(password):
@@ -48,7 +49,11 @@ def portnorm(p):
 
 def kuma_message(cfg,state,rows):
  parts=[]
- if not state['healthy']:parts.append('ARP Watch monitoring unavailable. Detection cannot be confirmed.')
+ if not state['healthy']:
+  parts.append('ARP Watch monitoring unavailable. Detection cannot be confirmed.\n'+'\n'.join(availability_lines(state['availability'])) if state.get('availability') else 'ARP Watch monitoring unavailable. Detection cannot be confirmed.')
+ elif state.get('last_availability_outage'):
+  outage=state['last_availability_outage']
+  parts.append('Monitoring recovered. No current availability failure.\nUnavailable since: '+outage['started_at']+'\nRecovered at: '+outage['recovered_at']+'\nDuration: '+str(outage['duration_seconds'])+' seconds\nAddresses affected during outage: '+(', '.join(outage.get('failed_ips',[])) or 'none identified; see probe error')+'\nEarlier failure:\n'+'\n'.join(availability_lines(outage['last_details'])))
  for row in rows:
   if row['resolved_at']:continue
   target=next((t for t in cfg['targets'] if t['ip']==row['ip']),{})
@@ -87,10 +92,14 @@ def kuma_report(cfg,store,sensor):
    url=cfg['kuma_push_url']+'?'+urlencode({'status':'up' if st['state']=='clear' else 'down','msg':message})
    with opener.open(url,timeout=8) as response:
     if not json.load(response).get('ok'):raise RuntimeError('Kuma rejected heartbeat')
-   with sensor.lock:sensor.status['notification_error']=None;sensor.status['notification_last_sent']=now()
+   with sensor.lock:
+    if sensor.status.get('notification_error'):sensor.availability.log('notification_recovered',{'interface':cfg.get('interface')})
+    sensor.status['notification_error']=None;sensor.status['notification_last_sent']=now()
   except Exception as e:
-   # Never include the secret push URL in errors or logs.
-   with sensor.lock:sensor.status['notification_error']=type(e).__name__
+   # Redact credentials and push URLs before recording notification failures.
+   error=safe_error(e,cfg)
+   with sensor.lock:sensor.status['notification_error']=error
+   sensor.availability.log('notification_failed',{'error':error,'interface':cfg.get('interface')})
   time.sleep(60)
 def parse_mac_table(text,mac,family):
  rows=[]
@@ -112,6 +121,7 @@ def parse_mac_table(text,mac,family):
  return rows
 class Store:
  def __init__(self,path):
+  self.path=pathlib.Path(path)
   self.lock=threading.RLock();self.db=sqlite3.connect(path,check_same_thread=False);self.db.row_factory=sqlite3.Row
   self.db.executescript('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY,signature TEXT,ip TEXT,kind TEXT,macs TEXT,approved TEXT,first_seen TEXT,last_seen TEXT,hits INTEGER DEFAULT 1,resolved_at TEXT,trace TEXT DEFAULT "{}"); CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,incident INTEGER,time TEXT,kind TEXT,data TEXT);')
  def event(self,i,kind,data):self.db.execute('INSERT INTO events(incident,time,kind,data) VALUES(?,?,?,?)',(i,now(),kind,json.dumps(data)))
@@ -168,6 +178,7 @@ def retention_worker(cfg,store,sensor):
 class Sensor:
  def __init__(self,cfg,store):
   self.cfg=cfg;self.store=store;self.lock=threading.RLock();self.status={'last_cycle':0,'error':'Starting','targets':{},'trace_error':None};self.jobs=queue.Queue();self.pending=set()
+  self.availability=Availability(store.path.parent/'availability.jsonl');self.current_probe_ip=None
  def frame(self,ip):
   # Use the interface's assigned address, not a 0.0.0.0 DAD probe.
   # Repeated DAD probes can make a starting Windows host reject its own IP.
@@ -195,7 +206,7 @@ class Sensor:
  def traces_pending(self):
   with self.lock:return bool(self.pending)
  def cycle(self):
-  with self.lock:cfg=copy.deepcopy(self.cfg);revision=cfg.get('_revision',0);targets={ip:t for ip,t in self.status['targets'].items() if t.get('discovery')}
+  with self.lock:cfg=copy.deepcopy(self.cfg);revision=cfg.get('_revision',0);previous=copy.deepcopy(self.status['targets']);targets={ip:t for ip,t in previous.items() if t.get('discovery')}
   trusted={t['ip'] for t in cfg['targets']};network=cfg.get('discovery_network','')
   all_candidates=discovery_hosts(network,trusted|{getattr(self,'local_ip','')})
   followups=list(dict.fromkeys(r['ip'] for r in self.store.rows() if not r['resolved_at'] and r['ip'] in all_candidates))[:64]
@@ -212,9 +223,11 @@ class Sensor:
   self.discovery_seen.update(followups)
   selections=cfg['targets']+[{'ip':ip,'name':'Subnet discovery','approved_macs':[],'vlan':1,'discovery':True} for ip in followups+batch]
   for target in selections:
-   ip=target['ip'];replies=self.probe(ip);approved=target['approved_macs'];macs=sorted(replies)
+   ip=target['ip'];self.current_probe_ip=ip;replies=self.probe(ip);self.current_probe_ip=None;approved=target['approved_macs'];macs=sorted(replies)
    i,new=self.store.detect(ip,macs,approved,{'source':'ARP probe','interface':cfg['interface'],'sender_ip':getattr(self,'local_ip','unavailable'),'replies':list(replies.values())})
    targets[ip]={'name':target['name'],'vlan':target.get('vlan',1),'approved_macs':approved,'observed_macs':macs,'checked_at':now(),'conflict_present':bool(set(macs)-set(approved)) if approved else len(macs)>1,'responded':bool(macs),'discovery':target.get('discovery',False)}
+   old=previous.get(ip,{})
+   targets[ip]['last_reply_at']=targets[ip]['checked_at'] if macs else old.get('last_reply_at') or (old.get('checked_at') if old.get('responded') else None)
    # Publish this observation immediately so a simultaneous notification does
    # not describe the preceding clean cycle after detecting a new conflict.
    with self.lock:
@@ -227,11 +240,12 @@ class Sensor:
      retry_seconds=30 if any(e.startswith('MAC absent or ambiguous') for e in old.get('errors',[])) else 300
      if new or not old or (old.get('status')!='access_port' and time.time()-old.get('epoch',0)>retry_seconds):self.queue_trace(i,mac)
   with self.lock:
-   if self.cfg.get('_revision',0)==revision:self.status.update(last_cycle=time.time(),error=None,targets=targets,discovery_checked=len(self.discovery_seen),discovery_total=len(all_candidates),discovery_cursor=getattr(self,'scan_index',0),cycle_seconds=len(selections)*1.2)
+   if self.cfg.get('_revision',0)==revision:self.status.update(last_cycle=time.time(),error=None,failed_probe_ip=None,targets=targets,discovery_checked=len(self.discovery_seen),discovery_total=len(all_candidates),discovery_cursor=getattr(self,'scan_index',0),cycle_seconds=len(selections)*1.2)
 
  def run(self):
   while True:
    started=time.monotonic()
+   self.current_probe_ip=None
    try:
     iface=self.cfg['interface']
     if not iface or (not self.cfg.get('targets') and not self.cfg.get('discovery_network')):raise ValueError('Complete the setup wizard before monitoring')
@@ -239,8 +253,10 @@ class Sensor:
     self.mac=bytes.fromhex(pathlib.Path('/sys/class/net/'+iface+'/address').read_text().strip().replace(':',''))
     self.sock=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0806));self.sock.bind((iface,0));self.sock.settimeout(.1)
     self.cycle()
+    self.snapshot()
    except Exception as e:
-    with self.lock:self.status['error']=type(e).__name__+': '+str(e)[:160]
+    with self.lock:self.status.update(error=safe_error(e,self.cfg),failed_probe_ip=self.current_probe_ip)
+    self.snapshot()
    finally:
     if hasattr(self,'sock'):self.sock.close()
    time.sleep(max(1,self.cfg['interval']-(time.monotonic()-started)))
@@ -249,6 +265,8 @@ class Sensor:
   expected=[t['ip'] for t in self.cfg['targets']];freshness=max(self.cfg['interval']*3,st.get('cycle_seconds',0)+self.cfg['interval']+15)
   healthy=not st['error'] and time.time()-st['last_cycle']<freshness and all(st['targets'].get(ip,{}).get('responded') for ip in expected) and bool(expected or self.cfg.get('discovery_network'))
   n=self.store.open_count();st.update(healthy=healthy,open_count=n,state='unavailable' if not healthy else 'incident' if n else 'clear',message='Monitoring unavailable' if not healthy else str(n)+' unresolved incident(s)' if n else 'No unresolved conflicts detected',checked_scope=self.cfg.get('scope_label','Configured addresses / VLAN 1'),trace_jobs=self.jobs.qsize(),probe_interval=self.cfg['interval'],interface=self.cfg.get('interface',''),segments=self.cfg.get('segments',[{'id':1,'name':'Main LAN','network':self.cfg.get('network','Configured LAN'),'status':'active','note':'Selected addresses only.'}]))
+  st['availability']=availability_details(st,self.cfg['targets'],self.cfg['interval'],time.time())
+  st['last_availability_outage']=self.availability.observe(healthy,st['availability'])
   return st
  def tracer(self):
   from cli_runtime import CLI
