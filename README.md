@@ -23,6 +23,24 @@ Duplicate IP addresses can interrupt access to critical services. Switch logs al
 - Configurable resolved-incident retention: 30 days by default, counted from resolution; 0 keeps history indefinitely. Unresolved incidents never expire.
 - Detailed Uptime Kuma push messages with MACs, last confirmed switch, port, VLAN, and path. Kuma can deliver Telegram notifications and reminders.
 
+## Windows startup compatibility — 19 October 2026
+
+**Upgrade older installations before continuing active monitoring.** Earlier versions sent repeated ARP probes with sender IPv4 `0.0.0.0`. If a probe arrives while Windows is checking its address during startup or DHCP configuration, Windows can interpret it as a competing address probe and reject its own IP. [Microsoft describes this duplicate-address detection behavior](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/event-4199-windows-client-cannot-get-ip-address-dhcp-server).
+
+ARP Watch now sends normal ARP requests using the IPv4 address assigned to the selected Linux interface and its real MAC. If a usable interface IPv4 address is unavailable, it reports monitoring unavailable and sends no requests; it never falls back to `0.0.0.0`. Saved packet evidence records the actual sender IP. Duplicate-IP detection, approved-MAC comparisons, saved incidents, switch tracing, and Kuma integration remain available.
+
+From the existing installation directory:
+
+```sh
+docker compose stop arp-watch
+git pull --ff-only
+docker compose up -d --build
+```
+
+Keep your private configuration and persistent data. If an older version has already caused Windows to reject its address, first stop ARP Watch, then use the affected machine's local or hypervisor console to restart its network adapter and verify recovery. Keep Windows duplicate-address detection enabled.
+
+Regression tests check the request's source/target fields and reject unspecified, loopback, link-local, multicast, broadcast, and IPv6 sender addresses. A corrected request was also tested against two responders in an isolated Ethernet network, including retained evidence and manual resolution. These checks do not guarantee that every operating system, network design, or future reboot condition has been tested.
+
 ## Requirements
 
 Linux, Docker Compose, and Layer 2 access to the monitored network. The included image uses Python 3.12 because the legacy Telnet adapter requires `telnetlib`. Use read-only switch accounts where supported. Credentials and push tokens must remain private.
