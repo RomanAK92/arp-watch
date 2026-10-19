@@ -96,6 +96,27 @@ ARP Watch sends heartbeats every 60 seconds. A conflict or unavailable monitorin
 
 Alerts include known approved names and optional explicit `device_labels`. Unknown device names remain unknown. A bounded 10-second wait allows quick tracing to finish before sending; incomplete or pending traces are labelled and subsequent heartbeats contain updated evidence. A final port cannot be guaranteed if the MAC ages out, switch management is unreachable, a device is unsupported, or an unmanaged switch sits downstream.
 
+## Monitoring availability diagnostics
+
+When checks become unavailable, logs and Uptime Kuma messages include the monitored IP addresses without ARP replies, their names and last successful reply when known, probe errors and the target being checked, or stale-result age and threshold. A missing ARP reply means the sensor did not observe a reply; it does not prove a device is offline.
+
+Recovery messages include the outage duration and earlier failure details for 15 minutes after recovery. These summaries reset when the process restarts; persisted logs remain available. Heartbeats still run every 60 seconds, so very short failures can appear in logs or a later heartbeat without causing a separate Kuma status-change notification. Monitoring availability errors are separate from duplicate-IP incidents and do not automatically resolve incidents.
+
+Diagnostics are written to Docker stdout and `data/availability.jsonl`. The private file survives container recreation and rotates at 2 MiB, keeping three rotated files plus the current file. This size-based rotation is independent of incident retention. It does not guarantee 30 days of diagnostic history. Repeated unchanged probe failures are logged at most once every five minutes; changed reasons and recovery are logged immediately when observed.
+
+Kuma delivery errors and subsequent recovery are logged locally. Passwords, configured tokens and HTTP URLs are redacted from error text. No alert can be delivered to Kuma while its connection is unavailable. Telegram notification routing remains in your separate Uptime Kuma installation.
+
+For example, a monitoring-availability alert can report:
+
+```text
+ARP Watch monitoring unavailable. Detection cannot be confirmed.
+Interface: eth0
+192.0.2.10 (Lab server): No ARP reply observed
+Last reply: 2026-01-01T12:00:00+00:00
+```
+
+After updating, rebuild and recreate the service with `docker compose up -d --build`. Existing configuration and incident data are retained. Back up private configuration and data before upgrading.
+
 ## Settings, storage, and backup
 
 Use **Settings** to change the account or retention policy. The current password is required. Credential changes sign out all sessions without stopping monitoring. Account and wizard configuration overrides persist atomically in private `data/settings.json`; they take precedence over the read-only initial `config.json`. This private file can contain switch secrets and the Kuma push token, as well as password hashes. Never publish it.
