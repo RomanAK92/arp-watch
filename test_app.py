@@ -1,9 +1,24 @@
-import tempfile,unittest,pathlib,time
+import tempfile,unittest,pathlib,time,socket,struct
 from app import Store,Sensor,parse_mac_table,kuma_message,save_settings,load_settings,password_hash,password_matches
 from officeconnect import parse_table
 class Tests(unittest.TestCase):
  def setUp(self):self.tmp=tempfile.TemporaryDirectory();self.path=pathlib.Path(self.tmp.name)/'test.sqlite';self.s=Store(self.path)
  def tearDown(self):self.s.db.close();self.tmp.cleanup()
+ def test_monitor_requests_do_not_compete_with_windows_dad(self):
+  sensor=Sensor({},self.s);sensor.local_ip='192.0.2.100';sensor.mac=bytes.fromhex('020000000100')
+  frame=sensor.frame('192.0.2.10')
+  self.assertEqual(len(frame),42)
+  self.assertEqual(frame[:6],b'\xff'*6)
+  self.assertEqual(frame[6:12],sensor.mac)
+  self.assertEqual(struct.unpack('!HHBBH',frame[14:22]),(1,0x0800,6,4,1))
+  self.assertEqual(frame[22:28],sensor.mac)
+  self.assertEqual(socket.inet_ntoa(frame[28:32]),'192.0.2.100')
+  self.assertEqual(socket.inet_ntoa(frame[38:42]),'192.0.2.10')
+ def test_monitor_does_not_fall_back_to_an_unassigned_source(self):
+  sensor=Sensor({},self.s);sensor.mac=bytes.fromhex('020000000100')
+  for source in ['', '0.0.0.0','169.254.1.2','127.0.0.1','224.0.0.1','255.255.255.255','::1']:
+   sensor.local_ip=source
+   with self.subTest(source=source),self.assertRaises(ValueError):sensor.frame('192.0.2.10')
  def test_latch_resolve_restart_and_recurrence(self):
   good='02:00:00:00:00:01';bad='02:00:00:00:00:02';i,new=self.s.detect('192.0.2.1',[good,bad],[good],{'test':'isolated'})
   self.assertTrue(new);self.s.trace_update(i,bad,{'path':[{'switch_ip':'192.0.2.189','port':'18'}]})
