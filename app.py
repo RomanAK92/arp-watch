@@ -169,7 +169,11 @@ class Sensor:
  def __init__(self,cfg,store):
   self.cfg=cfg;self.store=store;self.lock=threading.RLock();self.status={'last_cycle':0,'error':'Starting','targets':{},'trace_error':None};self.jobs=queue.Queue();self.pending=set()
  def frame(self,ip):
-  return b'\xff'*6+self.mac+b'\x08\x06'+struct.pack('!HHBBH',1,0x0800,6,4,1)+self.mac+b'\0'*4+b'\0'*6+socket.inet_aton(ip)
+  # Use the interface's assigned address, not a 0.0.0.0 DAD probe.
+  # Repeated DAD probes can make a starting Windows host reject its own IP.
+  source=ipaddress.ip_address(getattr(self,'local_ip',''))
+  if source.version!=4 or source.is_unspecified or source.is_loopback or source.is_link_local or source.is_multicast or str(source)=='255.255.255.255':raise ValueError('Monitoring interface needs a usable assigned IPv4 address')
+  return b'\xff'*6+self.mac+b'\x08\x06'+struct.pack('!HHBBH',1,0x0800,6,4,1)+self.mac+source.packed+b'\0'*6+socket.inet_aton(ip)
  def probe(self,ip):
   replies={}
   for attempt in range(2):
@@ -209,7 +213,7 @@ class Sensor:
   selections=cfg['targets']+[{'ip':ip,'name':'Subnet discovery','approved_macs':[],'vlan':1,'discovery':True} for ip in followups+batch]
   for target in selections:
    ip=target['ip'];replies=self.probe(ip);approved=target['approved_macs'];macs=sorted(replies)
-   i,new=self.store.detect(ip,macs,approved,{'source':'ARP probe','interface':cfg['interface'],'sender_ip':'0.0.0.0','replies':list(replies.values())})
+   i,new=self.store.detect(ip,macs,approved,{'source':'ARP probe','interface':cfg['interface'],'sender_ip':getattr(self,'local_ip','unavailable'),'replies':list(replies.values())})
    targets[ip]={'name':target['name'],'vlan':target.get('vlan',1),'approved_macs':approved,'observed_macs':macs,'checked_at':now(),'conflict_present':bool(set(macs)-set(approved)) if approved else len(macs)>1,'responded':bool(macs),'discovery':target.get('discovery',False)}
    # Publish this observation immediately so a simultaneous notification does
    # not describe the preceding clean cycle after detecting a new conflict.
